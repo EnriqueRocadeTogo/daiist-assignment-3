@@ -35,6 +35,10 @@ ROOT = Path(__file__).resolve().parent
 EVAL_DIR = ROOT / "eval"
 ANSWERS, JUDGEMENTS = EVAL_DIR / "answers.jsonl", EVAL_DIR / "judgements.jsonl"
 RUBRIC = EVAL_DIR / "judge_rubric.md"
+# Not the agent's model, so it does not grade itself. (gemini-3-flash-preview, the first choice,
+# allows only 20 requests a day on the free tier.)
+JUDGE_MODEL = "gemma-4-31b-it"
+JUDGE_PARALLEL = 4  # judge calls at a time: the judge is slow (~1 min per answer)
 KS = (1, 3, 5)
 
 
@@ -114,6 +118,34 @@ def needs_answer(question: dict, rec: dict | None) -> bool:
     return rec is None or rec["question"] != question["question"] or rec.get("config") != config_signature()
 
 
+def error_text(error: BaseException) -> str:
+    """The message of an error, including errors wrapped in an ExceptionGroup."""
+    if isinstance(error, BaseExceptionGroup):
+        return " ".join(error_text(e) for e in error.exceptions)
+    return f"{type(error).__name__}: {error}"
+
+
+async def with_retry(call, attempts: int = 4, wait: int = 60, sleep=asyncio.sleep):
+    """Run `call()`, retrying while Gemini is briefly busy (503, or 429 per minute).
+
+    The daily free-tier quota does not come back by waiting, so that stops at once;
+    every answer and verdict so far is already saved, and the next run resumes.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call()
+        except Exception as error:  # noqa: BLE001 - classified below, re-raised if not transient
+            text = error_text(error)
+            if "PerDay" in text:
+                raise SystemExit("Daily Gemini quota used up. Progress is saved: run "
+                                 "`main.py evaluate` again tomorrow to continue.") from error
+            busy = any(code in text for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+            if not busy or attempt == attempts:
+                raise
+            print(f"  Gemini is busy, waiting {wait * attempt}s before retrying ...")
+            await sleep(wait * attempt)
+
+
 async def answer_all(questions: list[dict]) -> dict[str, dict]:
     answers = {r["id"]: r for r in read_jsonl(ANSWERS)}  # the last line per id wins
     todo = [q for q in questions if needs_answer(q, answers.get(q["id"]))]
@@ -121,7 +153,7 @@ async def answer_all(questions: list[dict]) -> dict[str, dict]:
         async with agent.mcp_tools() as tools:
             graph = agent.build_agent(tools)
             for n, q in enumerate(todo, start=1):
-                rec = await agent.ask(q["question"], graph, approve=lambda action: False)  # never add documents here
+                rec = await with_retry(lambda: agent.ask(q["question"], graph, approve=lambda action: False))  # never add documents
                 rec.update(id=q["id"], question=q["question"], config=config_signature())
                 append_jsonl(ANSWERS, rec)
                 answers[q["id"]] = rec
@@ -174,8 +206,18 @@ def refusal_verdict(question: dict) -> dict:
 # 4. LLM judge (cached per question, answer and rubric)
 # ---------------------------------------------------------------------------
 
-def judge(question: dict, rec: dict, rubric: str) -> dict:
+def judge_model():
+    """The judge's chat model. It loads the API key itself: when every answer is
+    cached, the agent never runs and nothing else would load it."""
     from langchain_google_genai import ChatGoogleGenerativeAI
+
+    from api_key import load_api_key
+
+    load_api_key()
+    return ChatGoogleGenerativeAI(model=JUDGE_MODEL, temperature=0, max_retries=2)  # with_retry handles the rest
+
+
+async def judge(question: dict, rec: dict, rubric: str) -> dict:
     from pydantic import BaseModel, Field
 
     class Verdict(BaseModel):
@@ -188,30 +230,50 @@ def judge(question: dict, rec: dict, rubric: str) -> dict:
               f"## Reference answer\n{question['reference_answer']}\n\n"
               f"## Retrieved passages (the only evidence)\n{rec['retrieved'] or '(none)'}\n\n"
               f"## Answer to grade\n{answer}")
-    model = ChatGoogleGenerativeAI(model=agent.MODEL, temperature=0, max_retries=6)
-    verdict = model.with_structured_output(Verdict).invoke(prompt)
+    model = judge_model()
+    verdict = await model.with_structured_output(Verdict).ainvoke(prompt)
     return {"correct": int(verdict.correct), "supported": int(verdict.supported), "reason": verdict.reason}
 
 
-def judge_all(questions: list[dict], answers: dict, checks: dict) -> dict[str, dict]:
+async def run_limited(calls: list, limit: int) -> list:
+    """Await every call, at most `limit` at a time; results keep the calls' order."""
+    gate = asyncio.Semaphore(limit)
+
+    async def one(call):
+        async with gate:
+            return await call()
+
+    return await asyncio.gather(*(one(c) for c in calls))
+
+
+async def judge_all(questions: list[dict], answers: dict, checks: dict) -> dict[str, dict]:
     if not RUBRIC.exists():
         print("  eval/judge_rubric.md is missing: only refusals are graded (in code).")
         return {q["id"]: refusal_verdict(q) for q in questions if checks[q["id"]]["refused"]}
     rubric = RUBRIC.read_text(encoding="utf-8")
-    rubric_hash = hashlib.sha1(rubric.encode()).hexdigest()[:8]
+    rubric_hash = hashlib.sha1((JUDGE_MODEL + rubric).encode()).hexdigest()[:8]  # new judge or rubric -> judge again
     cached = {(r["id"], r["answer"], r["rubric"]): r["verdict"] for r in read_jsonl(JUDGEMENTS)}
-    verdicts = {}
+    verdicts, todo = {}, []
     for q in questions:
         rec = answers[q["id"]]
+        key = (q["id"], rec["answer"], rubric_hash)
         if checks[q["id"]]["refused"]:
             verdicts[q["id"]] = refusal_verdict(q)
-            continue
-        key = (q["id"], rec["answer"], rubric_hash)
-        if key not in cached:
-            cached[key] = judge(q, rec, rubric)
-            append_jsonl(JUDGEMENTS, {"id": q["id"], "answer": rec["answer"], "rubric": rubric_hash, "verdict": cached[key]})
-            print(f"  judged {q['id']}")
-        verdicts[q["id"]] = cached[key]
+        elif key in cached:
+            verdicts[q["id"]] = cached[key]
+        else:
+            todo.append((q, rec))
+
+    def judge_one(q: dict, rec: dict):
+        async def call():
+            verdict = await with_retry(lambda: judge(q, rec, rubric), attempts=6)  # Gemma is often busy (503)
+            append_jsonl(JUDGEMENTS, {"id": q["id"], "answer": rec["answer"], "rubric": rubric_hash, "verdict": verdict})
+            print(f"  judged {q['id']}", flush=True)
+            return verdict
+        return call
+
+    results = await run_limited([judge_one(q, rec) for q, rec in todo], limit=JUDGE_PARALLEL)
+    verdicts.update({q["id"]: v for (q, _), v in zip(todo, results)})
     return verdicts
 
 
@@ -263,7 +325,8 @@ def agreement(judge_verdicts: dict, human: dict) -> dict:
 def main(retrieval_only: bool = False) -> None:
     questions = read_questions()
     print(f"1. Retrieval over {len(questions)} questions")
-    summary = {"retrieval": evaluate_retrieval(questions)}
+    summary = {"models": {"agent": agent.MODEL, "judge": JUDGE_MODEL, "design": index.CHOSEN_DESIGN},
+               "retrieval": evaluate_retrieval(questions)}
     if retrieval_only:  # `python evaluate.py --retrieval-only`: compare designs before choosing one
         (EVAL_DIR / "retrieval.json").write_text(json.dumps(summary["retrieval"], indent=2))
         return
@@ -274,7 +337,7 @@ def main(retrieval_only: bool = False) -> None:
 
     print("3-4. Code checks and judge")
     checks = {q["id"]: code_checks(q, answers[q["id"]]) for q in questions}
-    verdicts = judge_all(questions, answers, checks)
+    verdicts = asyncio.run(judge_all(questions, answers, checks))
 
     rows = []
     for q in questions:

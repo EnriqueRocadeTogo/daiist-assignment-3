@@ -52,3 +52,16 @@ def test_las_frases_fijas_de_agents_md_coinciden_con_el_codigo():
     rules = (Path(agent.ROOT) / "AGENTS.md").read_text(encoding="utf-8")
     for fixed in (agent.REFUSAL, agent.PARTIAL_PREFIX, agent.DISCLAIMER):
         assert fixed in rules
+
+
+def test_el_mensaje_de_estado_de_add_document_no_pasa_por_el_guardrail():
+    estado = "He añadido el documento: 'Padron' añadido, 140 trozos ya se pueden buscar."
+    messages = [
+        HumanMessage("Añade corpus/Padron.pdf"),
+        AIMessage("", tool_calls=[{"name": "add_document", "args": {"path": "corpus/Padron.pdf"}, "id": "1"}]),
+        ToolMessage("Added 'Padron': 140 chunks are now searchable.", name="add_document", tool_call_id="1"),
+        AIMessage(estado),
+    ]
+    result = agent.summarise(messages, seconds=1.0)
+    assert result["answer"] == estado and result["guardrail"] is None
+    assert result["tool_results"] == [{"name": "add_document", "text": "Added 'Padron': 140 chunks are now searchable."}]

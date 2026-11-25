@@ -105,3 +105,92 @@ def test_an_answer_is_reused_only_for_the_same_question_and_configuration():
     assert evaluate.needs_answer(q, None)
     assert evaluate.needs_answer(q, {**same, "question": "¿Otra?"})
     assert evaluate.needs_answer(q, {**same, "config": "article|otro-modelo|00000000"})
+
+
+def test_the_judge_is_a_different_model_from_the_agent():
+    """Decision: a separate judge avoids a model grading its own answers."""
+    assert evaluate.JUDGE_MODEL != agent.MODEL
+
+
+# --- retrying Gemini when it is briefly busy -------------------------------------------
+
+import asyncio
+
+import pytest
+
+
+class Flaky:
+    """An async call that fails with the given errors, then returns "ok"."""
+
+    def __init__(self, *errors):
+        self.errors, self.calls = list(errors), 0
+
+    async def __call__(self):
+        self.calls += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return "ok"
+
+
+def run_with_retry(call):
+    waits = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    result = asyncio.run(evaluate.with_retry(call, wait=60, sleep=fake_sleep))
+    return result, waits
+
+
+def test_with_retry_waits_longer_each_time_gemini_is_overloaded():
+    call = Flaky(RuntimeError("503 UNAVAILABLE high demand"), RuntimeError("503 UNAVAILABLE high demand"))
+    assert run_with_retry(call) == ("ok", [60, 120])
+
+
+def test_with_retry_stops_at_once_when_the_daily_quota_is_used_up():
+    call = Flaky(RuntimeError("429 RESOURCE_EXHAUSTED quotaId GenerateRequestsPerDayPerProjectPerModel-FreeTier"))
+    with pytest.raises(SystemExit, match="tomorrow"):
+        run_with_retry(call)
+    assert call.calls == 1
+
+
+def test_with_retry_does_not_retry_a_real_bug():
+    call = Flaky(KeyError("answer"))
+    with pytest.raises(KeyError):
+        run_with_retry(call)
+    assert call.calls == 1
+
+
+def test_with_retry_reads_errors_wrapped_in_an_exception_group():
+    wrapped = ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError("503 UNAVAILABLE")])
+    assert run_with_retry(Flaky(wrapped)) == ("ok", [60])
+
+
+def test_the_judge_loads_the_api_key_itself(tmp_path, monkeypatch):
+    """Regression: with every answer cached the agent never runs, so nothing else loads the key."""
+    import api_key
+
+    env = tmp_path / ".env"
+    env.write_text("GEMINI_API_KEY=dummy-key-for-test\n")
+    monkeypatch.setattr(api_key, "ENV_FILE", env)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    assert evaluate.judge_model().model.endswith(evaluate.JUDGE_MODEL)
+
+
+def test_run_limited_runs_calls_in_parallel_but_never_more_than_the_limit():
+    running, peak, done = 0, 0, []
+
+    def make(i):
+        async def call():
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+            done.append(i)
+            return i
+        return call
+
+    results = asyncio.run(evaluate.run_limited([make(i) for i in range(10)], limit=4))
+    assert results == list(range(10)) and sorted(done) == list(range(10))
+    assert peak == 4

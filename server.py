@@ -41,7 +41,7 @@ def search(query: str) -> str:
 
 @mcp.tool()
 def add_document(path: str) -> str:
-    """Add a document (a PDF, HTML, TXT or MD file on this computer) to the collection.
+    """Add a document (a PDF, TXT or MD file on this computer) to the collection.
 
     Extracts, chunks and embeds the file with the same pipeline as the corpus,
     then makes it searchable. The source name in citations is the file name

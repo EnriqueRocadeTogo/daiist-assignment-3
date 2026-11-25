@@ -38,7 +38,8 @@ from mcp.client.stdio import stdio_client
 from api_key import load_api_key
 
 ROOT = Path(__file__).resolve().parent
-MODEL = "gemini-3.5-flash"  # 2.5-flash is closed to new API keys; 3.8 often returns 503
+# Free tier: 3.5-flash allows only 20 requests a day; flash-lite has more room.
+MODEL = "gemini-3.5-flash-lite"
 MAX_MODEL_CALLS = 6  # a question needs ~2-3 (search, maybe search again, answer)
 
 # "[LAU, Artículo 36, p. 25]": the source has no comma, the location may have one.
@@ -155,15 +156,20 @@ def summarise(messages: list, seconds: float) -> dict:
     """The final answer (after the guardrail) plus everything evaluate.py needs."""
     tool_calls = [{"name": c["name"], "args": c["args"]}
                   for m in messages if m.type == "ai" for c in (m.tool_calls or [])]
-    retrieved = [m.text for m in messages if m.type == "tool" and m.name == "search"]
+    tool_results = [{"name": m.name, "text": m.text} for m in messages if m.type == "tool"]
+    retrieved = [r["text"] for r in tool_results if r["name"] == "search"]
     usage = [m.usage_metadata for m in messages if m.type == "ai" and m.usage_metadata]
     raw_answer = messages[-1].text if messages[-1].type == "ai" else ""
-    problem = citation_problem(raw_answer, retrieved)
+    # The reply to an add_document request is a status message, not an answer
+    # from the corpus, so only answers to questions go through the guardrail.
+    added = any(c["name"] == "add_document" for c in tool_calls)
+    problem = None if added else citation_problem(raw_answer, retrieved)
     return {
         "answer": REFUSAL if problem else raw_answer,
         "raw_answer": raw_answer,  # what the model wrote, kept to show when the guardrail fired
         "guardrail": problem,      # None, or why the answer was replaced
         "tool_calls": tool_calls,
+        "tool_results": tool_results,
         "retrieved": "\n\n".join(retrieved),
         "input_tokens": sum(u["input_tokens"] for u in usage),
         "output_tokens": sum(u["output_tokens"] for u in usage),
